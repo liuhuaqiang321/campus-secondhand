@@ -111,13 +111,17 @@ document.addEventListener('click', (e) => {
 // ========== 登录态与导航 ==========
 function refreshNav() {
     const user = currentUser();
+    const adminEntry = document.getElementById('adminEntry');
     if (user) {
         document.getElementById('userInfo').style.display = 'none';
         document.getElementById('userLoggedIn').style.display = 'flex';
         document.getElementById('nicknameDisplay').textContent = user.nickname || user.username;
+        // 仅管理员可见「管理后台」入口
+        if (adminEntry) adminEntry.style.display = Number(user.role) === 1 ? 'inline-block' : 'none';
     } else {
         document.getElementById('userInfo').style.display = 'flex';
         document.getElementById('userLoggedIn').style.display = 'none';
+        if (adminEntry) adminEntry.style.display = 'none';
     }
 }
 

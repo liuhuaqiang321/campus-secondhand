@@ -201,6 +201,11 @@ const db = {
             if (error) return fail(translateError(error));
             const profileRes = await db.user.getProfile(data.user.id);
             if (profileRes.code !== 200) return profileRes;
+            // 被管理员禁用的账号不允许登录
+            if (Number(profileRes.data.status) === 0) {
+                await sb.auth.signOut();
+                return fail('该账号已被管理员禁用，如有疑问请联系管理员');
+            }
             db.state.uid = data.user.id;
             db.state.profile = profileRes.data;
             return ok(profileRes.data);
@@ -705,6 +710,246 @@ const db = {
             if (error) return fail(translateError(error));
             const { data } = sb.storage.from('item-images').getPublicUrl(path);
             return ok(data.publicUrl);
+        }
+    },
+
+    // ----------------------------------------------------
+    // 10. 管理员模块（后台管理，独立入口 admin.html）
+    //     数据权限由数据库 9.3 节的管理员 RLS 策略保障，
+    //     前端仅负责展示与调用，无法越权访问普通用户数据
+    // ----------------------------------------------------
+    admin: {
+        // 管理员登录：先验证账号密码，再校验 role = 1
+        async login(body) {
+            const username = String(body.username || '').trim();
+            if (!username || !body.password) return fail('请输入管理员账号和密码');
+            const { data, error } = await sb.auth.signInWithPassword({
+                email: toEmail(username),
+                password: body.password
+            });
+            if (error) return fail(translateError(error));
+
+            const profileRes = await db.user.getProfile(data.user.id);
+            if (profileRes.code !== 200) {
+                await sb.auth.signOut();
+                return profileRes;
+            }
+            const profile = profileRes.data;
+            if (Number(profile.role) !== 1) {
+                await sb.auth.signOut();
+                db.state.uid = null;
+                db.state.profile = null;
+                return fail('该账号不是管理员，无权进入后台');
+            }
+            if (Number(profile.status) !== 1) {
+                await sb.auth.signOut();
+                db.state.uid = null;
+                db.state.profile = null;
+                return fail('该账号已被禁用，无法登录');
+            }
+            db.state.uid = data.user.id;
+            db.state.profile = profile;
+            return ok(profile);
+        },
+
+        // 刷新页面后恢复后台登录态，并复核管理员身份
+        async check() {
+            const res = await db.init();
+            if (res.code !== 200) return res;
+            const profile = res.data;
+            if (!profile) return fail('尚未登录');
+            if (Number(profile.role) !== 1) return fail('该账号不是管理员');
+            if (Number(profile.status) !== 1) return fail('该账号已被禁用');
+            return ok(profile);
+        },
+
+        async logout() {
+            await sb.auth.signOut();
+            db.state.uid = null;
+            db.state.profile = null;
+            return ok(null);
+        },
+
+        // 数据看板
+        async stats() {
+            const countOf = async (table, build) => {
+                let query = sb.from(table).select('id', { count: 'exact', head: true });
+                if (build) query = build(query);
+                const { count, error } = await query;
+                return error ? 0 : (count || 0);
+            };
+            const startOfDay = new Date();
+            startOfDay.setHours(0, 0, 0, 0);
+            const todayIso = startOfDay.toISOString();
+
+            const [users, disabledUsers, items, onSale, orders, completed, messages, todayUsers, todayItems] =
+                await Promise.all([
+                    countOf('profiles'),
+                    countOf('profiles', q => q.eq('status', 0)),
+                    countOf('item'),
+                    countOf('item', q => q.eq('status', 1)),
+                    countOf('orders'),
+                    countOf('orders', q => q.eq('status', 4)),
+                    countOf('message'),
+                    countOf('profiles', q => q.gte('created_at', todayIso)),
+                    countOf('item', q => q.gte('created_at', todayIso))
+                ]);
+
+            const { data: doneRows } = await sb.from('orders').select('amount').eq('status', 4);
+            const amount = (doneRows || []).reduce((sum, r) => sum + Number(r.amount || 0), 0);
+
+            return ok({ users, disabledUsers, items, onSale, orders, completed, messages, amount, todayUsers, todayItems });
+        },
+
+        // 用户列表（分页 + 关键字）
+        async users(opts = {}) {
+            const keyword = String(opts.keyword || '').trim();
+            const page = Math.max(1, Number(opts.page) || 1);
+            const size = Math.max(1, Number(opts.size) || 10);
+            const from = (page - 1) * size;
+
+            let query = sb.from('profiles')
+                .select('id, username, nickname, phone, school, avatar, role, status, created_at', { count: 'exact' })
+                .order('created_at', { ascending: false })
+                .range(from, from + size - 1);
+            if (keyword) {
+                query = query.or(`username.ilike.%${keyword}%,nickname.ilike.%${keyword}%,phone.ilike.%${keyword}%`);
+            }
+            const { data, count, error } = await query;
+            if (error) return fail(translateError(error));
+            return ok({ list: camelKeys(data || []), total: count || 0, page, size });
+        },
+
+        // 启用 / 禁用用户
+        async setUserStatus(userId, status) {
+            if (userId === db.state.uid) return fail('不能禁用当前登录的管理员账号');
+            const { error } = await sb.from('profiles').update({ status: Number(status) }).eq('id', userId);
+            if (error) return fail(translateError(error));
+            return ok(null);
+        },
+
+        // 授予 / 撤销管理员
+        async setUserRole(userId, role) {
+            if (userId === db.state.uid) return fail('不能修改自己的角色，以免误操作失去后台权限');
+            const { error } = await sb.from('profiles').update({ role: Number(role) }).eq('id', userId);
+            if (error) return fail(translateError(error));
+            return ok(null);
+        },
+
+        // 商品列表（含已下架）
+        async items(opts = {}) {
+            const keyword = String(opts.keyword || '').trim();
+            const page = Math.max(1, Number(opts.page) || 1);
+            const size = Math.max(1, Number(opts.size) || 10);
+            const from = (page - 1) * size;
+            const hasStatus = opts.status !== '' && opts.status !== null && opts.status !== undefined;
+
+            let query = sb.from('item')
+                .select(ITEM_SELECT, { count: 'exact' })
+                .order('created_at', { ascending: false })
+                .range(from, from + size - 1);
+            if (hasStatus) query = query.eq('status', Number(opts.status));
+            if (keyword) query = query.ilike('title', `%${keyword}%`);
+
+            const { data, count, error } = await query;
+            if (error) return fail(translateError(error));
+            return ok({ list: (data || []).map(mapItem), total: count || 0, page, size });
+        },
+
+        async setItemStatus(itemId, status) {
+            const { error } = await sb.from('item').update({ status: Number(status) }).eq('id', itemId);
+            if (error) return fail(translateError(error));
+            return ok(null);
+        },
+
+        async deleteItem(itemId) {
+            const { error } = await sb.from('item').delete().eq('id', itemId);
+            if (error) return fail(translateError(error));
+            return ok(null);
+        },
+
+        // 分类管理
+        async categories() {
+            const { data, error } = await sb.from('category')
+                .select('*')
+                .order('parent_id', { ascending: true })
+                .order('sort_order', { ascending: true })
+                .order('id', { ascending: true });
+            if (error) return fail(translateError(error));
+            return ok(camelKeys(data || []));
+        },
+
+        async createCategory(body = {}) {
+            const name = String(body.name || '').trim();
+            if (!name) return fail('分类名称不能为空');
+            if (name.length > 20) return fail('分类名称不能超过 20 个字');
+            const payload = {
+                name,
+                parent_id: Number(body.parentId) || 0,
+                sort_order: Number(body.sortOrder) || 99,
+                status: 1
+            };
+            const { error } = await sb.from('category').insert(payload);
+            if (error) return fail(translateError(error));
+            return ok(null);
+        },
+
+        async updateCategory(id, patch = {}) {
+            const payload = {};
+            if (patch.name !== undefined) {
+                const name = String(patch.name).trim();
+                if (!name) return fail('分类名称不能为空');
+                payload.name = name;
+            }
+            if (patch.sortOrder !== undefined) payload.sort_order = Number(patch.sortOrder);
+            if (patch.status !== undefined) payload.status = Number(patch.status);
+            if (!Object.keys(payload).length) return fail('没有需要修改的内容');
+            const { error } = await sb.from('category').update(payload).eq('id', id);
+            if (error) return fail(translateError(error));
+            return ok(null);
+        },
+
+        async deleteCategory(id) {
+            const { count: childCount } = await sb.from('category')
+                .select('id', { count: 'exact', head: true })
+                .eq('parent_id', id);
+            if (childCount > 0) return fail('该类目下还有子分类，请先删除子分类');
+
+            const { count: itemCount } = await sb.from('item')
+                .select('id', { count: 'exact', head: true })
+                .eq('category_id', id);
+            if (itemCount > 0) return fail(`该类目下还有 ${itemCount} 件商品，无法删除`);
+
+            const { error } = await sb.from('category').delete().eq('id', id);
+            if (error) return fail(translateError(error));
+            return ok(null);
+        },
+
+        // 订单管理
+        async orders(opts = {}) {
+            const page = Math.max(1, Number(opts.page) || 1);
+            const size = Math.max(1, Number(opts.size) || 10);
+            const from = (page - 1) * size;
+            const hasStatus = opts.status !== '' && opts.status !== null && opts.status !== undefined;
+
+            let query = sb.from('orders')
+                .select(ORDER_SELECT, { count: 'exact' })
+                .order('created_at', { ascending: false })
+                .range(from, from + size - 1);
+            if (hasStatus) query = query.eq('status', Number(opts.status));
+
+            const { data, count, error } = await query;
+            if (error) return fail(translateError(error));
+            return ok({ list: (data || []).map(mapOrder), total: count || 0, page, size });
+        },
+
+        // 强制取消异常订单
+        async cancelOrder(orderId) {
+            const { error } = await sb.from('orders')
+                .update({ status: 5, cancel_time: new Date().toISOString() })
+                .eq('id', orderId);
+            if (error) return fail(translateError(error));
+            return ok(null);
         }
     }
 };

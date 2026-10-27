@@ -312,6 +312,47 @@ alter table public.message  enable row level security;
 alter table public.orders   enable row level security;
 alter table public.review   enable row level security;
 
+-- 9.1 管理员鉴权函数
+--     security definer：以函数属主身份查询 profiles，避免 RLS 自引用递归
+--     同时要求 status = 1，被禁用的管理员立即失去权限
+create or replace function public.is_admin()
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+    select exists (
+        select 1 from public.profiles
+        where id = auth.uid() and role = 1 and status = 1
+    );
+$$;
+
+-- 9.2 保护字段：普通用户不得修改自己的 role / status
+--     auth.uid() 为空表示在 SQL Editor（service_role）中执行，放行以便初始化管理员
+create or replace function public.guard_profile_privilege()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+    if auth.uid() is not null and not public.is_admin() then
+        if new.role is distinct from old.role then
+            raise exception '无权修改角色字段';
+        end if;
+        if new.status is distinct from old.status then
+            raise exception '无权修改账号状态';
+        end if;
+    end if;
+    return new;
+end $$;
+
+drop trigger if exists trg_profiles_guard on public.profiles;
+create trigger trg_profiles_guard before update on public.profiles
+    for each row execute function public.guard_profile_privilege();
+
+
 -- profiles：所有人可读（用于展示卖家昵称），仅本人可写
 drop policy if exists "profiles_select_all"  on public.profiles;
 create policy "profiles_select_all" on public.profiles for select using (true);
@@ -360,6 +401,36 @@ create policy "review_select_all" on public.review for select using (true);
 drop policy if exists "review_insert_self" on public.review;
 create policy "review_insert_self" on public.review
     for insert to authenticated with check (auth.uid() = reviewer_id);
+
+-- ============================================================
+-- 9.3 管理员策略（role = 1 的用户拥有后台管理权限）
+--     多个 permissive 策略之间是 OR 关系，故不影响普通用户原有权限
+-- ============================================================
+
+-- 用户管理：查看全部、修改状态与角色
+drop policy if exists "profiles_admin_update" on public.profiles;
+create policy "profiles_admin_update" on public.profiles
+    for update to authenticated
+    using (public.is_admin()) with check (public.is_admin());
+
+-- 商品管理：查看全部（含已下架）、上架/下架、删除
+drop policy if exists "item_admin_all" on public.item;
+create policy "item_admin_all" on public.item
+    for all to authenticated
+    using (public.is_admin()) with check (public.is_admin());
+
+-- 分类管理：新增、修改、删除
+drop policy if exists "category_admin_all" on public.category;
+create policy "category_admin_all" on public.category
+    for all to authenticated
+    using (public.is_admin()) with check (public.is_admin());
+
+-- 订单管理：查看全部订单、取消异常订单
+drop policy if exists "orders_admin_all" on public.orders;
+create policy "orders_admin_all" on public.orders
+    for all to authenticated
+    using (public.is_admin()) with check (public.is_admin());
+
 
 -- ============================================================
 -- 10. 图片存储桶（替代原项目「手填图片外链」）
@@ -421,6 +492,17 @@ from (values
     ('手机壳膜',    '数码配件', 3)
 ) as v(name, parent_name, sort_order)
 join public.category p on p.name = v.parent_name and p.parent_id = 0;
+
+-- ============================================================
+-- 12. 管理员账号（按需执行，不要直接跑）
+--   第 1 步：在网站前台正常注册一个专用账号，例如用户名 admin
+--   第 2 步：在本 SQL Editor 中执行下句提升为管理员
+--            update public.profiles set role = 1 where username = 'admin';
+--   第 3 步：打开 admin.html，用 admin 账号登录即可进入后台
+--   撤销管理员：
+--            update public.profiles set role = 0 where username = 'admin';
+--   注意：普通用户无法自行提权，角色的变更被 trg_profiles_guard 触发器拦截
+-- ============================================================
 
 -- ============================================================
 -- 执行完成后请确认：
