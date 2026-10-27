@@ -8,8 +8,8 @@
 // ============================================================
 
 const DEFAULT_CONFIG = {
-    url: '',        // 例：https://abcdefgh.supabase.co
-    anonKey: ''     // 例：eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+    url: 'https://wnqetxttrpjhyypenenj.supabase.co',
+    anonKey: 'sb_publishable_bJCl_cE99IJyLCIhb2Zqvw_eYgEifTQ'
 };
 
 (function () {

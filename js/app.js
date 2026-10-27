@@ -55,21 +55,24 @@ async function loadSupabaseSDK() {
 
 // ========== 启动流程 ==========
 document.addEventListener('DOMContentLoaded', async () => {
-    if (!window.isSupabaseConfigured()) {
-        location.replace('setup.html');
-        return;
-    }
-    const loaded = await loadSupabaseSDK();
-    if (!loaded) {
-        document.getElementById('itemList').innerHTML =
-            '<div class="empty"><span class="empty-icon">🔌</span>Supabase SDK 加载失败，请检查网络连接后刷新重试</div>';
-        return;
-    }
-    try {
-        db.connect();
-    } catch (e) {
-        renderConfigError(e.message);
-        return;
+    // OFFLINE_MODE：离线单机模式，数据存浏览器本地，无需服务器与网络
+    if (!window.OFFLINE_MODE) {
+        if (!window.isSupabaseConfigured()) {
+            location.replace('setup.html');
+            return;
+        }
+        const loaded = await loadSupabaseSDK();
+        if (!loaded) {
+            document.getElementById('itemList').innerHTML =
+                '<div class="empty"><span class="empty-icon">&#128268;</span>Supabase SDK 加载失败，请检查网络连接后刷新重试</div>';
+            return;
+        }
+        try {
+            db.connect();
+        } catch (e) {
+            renderConfigError(e.message);
+            return;
+        }
     }
 
     await db.init();
